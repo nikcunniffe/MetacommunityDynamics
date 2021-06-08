@@ -1,0 +1,967 @@
+---
+title: "Metacommunity dynamics and the spurious detection of species associations in co-occurrence analyses (supporting code)"
+author: "Vincent Calcagno, Nik Cunniffe, Frederic Hamelin"
+date: "8 June 2021"
+output: html_document
+bibliography: refs.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Initialisation
+
+Before running, clear the environment, load the packages for plotting and for various other intermediate calculations, load the genMeta functions, set a random seed for reproducibility and set global options
+```{r mainInit, message=F, warning=F}
+rm(list=ls())
+
+# load dependencies
+library(RColorBrewer)
+library(fields)
+library(Hmsc)
+library(snow)
+library(corrplot)
+
+# load our library (note this depends on EcoSimR and cubature, so they must be installed too)
+source("generalisedMetapopulations.R")
+
+rngSeed <- 1
+
+set.seed(20210109,
+         sample.kind = "Rounding")
+
+sigThresh <- 0.05     # threshold p-value for significance testing
+resortSpp <- TRUE     # resort the species in order of fastness for presentation?
+regularDist <- TRUE   # if this is TRUE, take non-disturbed species regularly-spaced along gradient of fastness
+
+testRun <- FALSE       # if FALSE then do a full length run, otherwise a short one for testing
+
+if(!testRun)
+{
+  thin <- 100           # for the Hmsc fits
+  samples <- 500        # for the Hmsc fits
+  nChains <- 3          # for the Hmsc fits
+  simReps <- 5000       # for the Gotelli algorithms
+  burnInReps <- 1000    # for the Gotelli algorithms
+}else{
+  thin <- 5             # for the Hmsc fits
+  samples <- 10         # for the Hmsc fits
+  nChains <- 2          # for the Hmsc fits
+  simReps <- 50         # for the Gotelli algorithms
+  burnInReps <- 10      # for the Gotelli algorithms
+}
+
+```
+
+## Set up the parameters controlling the synthetic community
+
+Set up the synthetic community of species. The species are chosen such that their prevalences in an undisturbed system in which the maximum patch age tends to infinity would be between 33.3% and 66.7%. The external migration rate was set to be zero, and the other parameters are tied together to ensure these final prevalences. We also randomly choose a subset of 6 of the 31 species to be immune from disturbance (note that if we instead want the species to be regularly spaced by ``fastness'', the selection is overwritten later).
+```{r speciesInit}
+nSpp <- 31            # number of species
+A <- 20               # max age of a patch
+mu <- 0.2             # death rate (assumed constant here)
+vM <- rep(0,nSpp)     # migration rate from an external source (fixed to zero here)
+
+r0 <- runif(nSpp,min=1.5,max=3)
+vA <- numeric(nSpp)     # final prevalence (if patches have no maximum age)
+vE <- numeric(nSpp)     # extinction rate
+vC <- numeric(nSpp)     # colonisation rate
+for(i in 1:length(r0))
+{
+  vA[i] <- runif(1,min=(1-1/r0[i]),max=1)
+  vC[i] <- r0[i]*vA[i]*mu / (r0[i]*(vA[i]-1)+1)
+  vE[i] <- vC[i] / r0[i] - mu
+}
+
+nPatches <- 1000
+```
+
+## Interact with the genMeta library and sample the patch occupancy matrices
+
+This calls our library to do the calculations and take samples, as well as to run the sim9 algorithm (@EcoSimRpackage).
+```{r genMeta}
+set.seed(rngSeed,sample.kind = "Rounding")
+
+m <- createModel(intTol=1e-10)
+m <- initParameters(m,nSpp,vM,vC,vE)
+m <- initPatchDeath(m,maxAge=A,r=mu)
+m <- doCalculations(m)
+l <- sampleCommunityMatrix(m,nPatches)
+c <- l$cMatrix
+# cache patch matrix and ages for use later
+patchMatrixCache <- c
+patchAgeCache <- l$patchAges
+modelCache <- m
+```
+
+## Reorder species by fastness, and introduce some species which are never disturbed
+
+This reorders the species by order of fastness (and chooses a set of species to not disturb, chosen randomly along the axis of fastness)
+```{r resortSpp}
+#
+# Resort species in order of "fastness" for presentation if necessary
+#
+numNonDisturb <- 6
+sppOrder <- 1:nSpp
+if(resortSpp)
+{
+  sppOrder <- order(m$modelCalculations$vVariance)
+}
+# sample non-disturbed species entirely randomly
+vNonDisturb <- rep(FALSE,nSpp)
+disturbSpp <- sample(1:nSpp,numNonDisturb) 
+vNonDisturb[disturbSpp] <- TRUE
+if(regularDist) # if desired, take the non-disturbed species to be regularly spaced
+{
+  vNonDisturb <- rep(FALSE,nSpp)
+  fstIDX <- (0:(numNonDisturb-1))*floor((nSpp/numNonDisturb)) + 2
+  disturbSpp <- numeric(numNonDisturb)
+  for(i in 1:length(fstIDX))
+  {
+    disturbSpp[i] <- sppOrder[fstIDX[i]]
+  }
+  vNonDisturb[disturbSpp] <- TRUE
+}
+```
+
+This resamples the community matrix, but then alters it to account for the idea of a subset of species never being disturbed, then redoes the sim9 calculations. Note again that information is cached, to allow these calculations to be redone using sim2 later.
+```{r nonDisturbed}
+
+# update the calculation matrix to reflect idea some patches are not valid
+minVar <- min(m$modelCalculations$vVariance)
+m$modelCalculations$vA[disturbSpp] <- NA
+m$modelCalculations$vR[disturbSpp] <- NA
+for(i in disturbSpp)
+{
+  m$modelCalculations$mCovariance[i,1:nSpp] <- NA
+  m$modelCalculations$mCovariance[1:nSpp,i] <- NA
+}
+# make sure these come out as having smallest variance in any later sorting
+# note a negative "variance" is okay, since all are relative to the average
+m$modelCalculations$vVariance[disturbSpp] <- minVar-1
+# alter the patch matrix to reflect non-disturbed patches
+for(s in disturbSpp)
+{
+  roots <- Re(polyroot(c(vM[s],(vC[s]-vM[s]-vE[s]),-vC[s])))
+  # the structure of the model means there can only ever be a single positive root
+  w <-  which(roots>0)
+  new_pi <- roots[w]
+  print(paste("Species", s, "-> Species", which(sppOrder==s), "in sorted order ->", new_pi))
+  c[,s] <- rbinom(nPatches,1,new_pi)
+}
+p <- initPairwise(c)
+p <- simPairwise(p,simReps,burnInReps,TRUE)
+pDistCached <- p
+# cache patch matrix and ages for use later
+patchMatrixCacheImmune <- c
+patchAgeCacheImmune <- l$patchAges
+modelCacheImmune <- m
+# And now reset back to the original state for first set of calculations
+c <- patchMatrixCache
+m <- modelCache
+```
+
+## Figure 3A. Species occupancy curves
+
+We now have all the required information to plot out the species occupancy curves (marking those which will be unperturbed in later figures by colouring them grey).
+```{r figSppCurves}
+par(mfrow=c(1,1))
+colfunc <- colorRampPalette(c("blue","red"))
+vCol <- colfunc(nSpp)
+par(las=1)
+par(mar=c(4.1, 6.1, 4.1, 4.1))
+for(i in 1:nSpp)
+{
+  thisI <- sppOrder[i]
+  
+  R_i <- vM[thisI]+vC[thisI]*m$modelCalculations$vP[thisI]+vE[thisI]
+  A_i <- (vM[thisI]+vC[thisI]*m$modelCalculations$vP[thisI])/R_i
+  
+  x<-seq(0,20,length.out=1000)
+  p_ix <- A_i*(1-exp(-R_i*x))
+  
+  thisCol <- vCol[i]
+  if(thisI %in% disturbSpp)
+  {
+    thisCol <- "grey"
+  }
+  if(i==1)
+  {
+    yLab <- expression(paste("Occupancy in patches of age x"))    
+
+    plot(x,
+         p_ix,
+         ylim=c(0,1),
+         ty="l",
+         col=thisCol,
+         xlab="Patch age (x)",
+         ylab=yLab,
+         main="Set of 31 species",
+         lwd=2,
+         cex.lab=1.5,
+         cex.axis=1.5,
+         cex.main=1.5)
+  }else
+  {
+    lines(x,
+          p_ix,
+          col=thisCol,
+          lwd=2)
+  }
+}
+legend("bottomright",
+       c("Fastest species","Slowest species","Undisturbed"),
+       col=c("blue","red","grey"),
+       lty=1,
+       lwd=2,
+       cex=1.5)
+```
+
+## Figure 3B. Pairwise covariances
+
+This calculates the pairwise covariance for species pairs, and stores it after subtracting the average variance. This is then plotted. The loop below also calculates the p-value for the Fisher exact test for all pairs of species, since that is needed later
+```{r fig3B}
+p <- initPairwise(c)
+p <- simPairwise(p,simReps,burnInReps,TRUE)
+# cache the state of p just before calling the Gotelli algorithm, so can be redone using sim2 later
+pOrigCache <- p 
+#
+# Variance relative to average and Fisher's exact test
+#
+predToPlot <- matrix(NA,nrow=nSpp,ncol=nSpp)
+pValToPlot <- matrix(NA,nrow=nSpp,ncol=nSpp)
+pairwiseCovar <- numeric(nSpp*(nSpp-1)/2)
+fisherP <- numeric(nSpp*(nSpp-1)/2)
+thisIDX <- 0
+for(i in 1:nSpp)
+{
+  for(j in 1:nSpp)
+  {
+    predToPlot[which(sppOrder==i),which(sppOrder==j)] <- m$modelCalculations$mCovariance[i,j] - m$modelCalculations$averageFastness
+    if(i < j)
+    {
+      int <- c[,i] + c[,j]
+      bothSpp <- sum(c[,i]&c[,j])
+      noSpp <- sum(!(c[,i]|c[,j]))
+      onlyI <- sum(c[,i])-bothSpp
+      onlyJ <- sum(c[,j])-bothSpp
+      
+      thisData <- matrix(c(noSpp,onlyI,onlyJ,bothSpp),
+                         nrow=2,
+                         dimnames = list(SppI = c("N","Y"),
+                                         SppJ = c("N","Y")))
+      
+      f <- fisher.test(thisData)
+      
+      pValToPlot[which(sppOrder==i),which(sppOrder==j)] <- f$p.value
+      pValToPlot[which(sppOrder==j),which(sppOrder==i)] <- f$p.value
+      
+      thisIDX <- thisIDX + 1
+      fisherP[thisIDX] <- f$p.value
+      pairwiseCovar[thisIDX] <- m$modelCalculations$mCovariance[i,j] - m$modelCalculations$averageFastness   
+    }
+  }
+}
+fisherPAdj <- p.adjust(fisherP, method = "fdr")
+
+minVal <- min(predToPlot)
+# ensure legend bar has a full set of labels
+if(minVal > -0.1)
+{
+  minVal <- -0.1
+}
+maxVal <- max(predToPlot)
+absMinVal <- abs(minVal)
+
+if(absMinVal > maxVal)
+{
+  minNum <- 50
+  maxNum <- ceiling((maxVal/absMinVal)*minNum)
+}else{
+  maxNum <- 50
+  minNum <- ceiling((absMinVal/maxVal)*maxNum)
+}
+
+cols = rev(brewer.pal(11,'RdBu'))
+rc1 <- colorRampPalette(colors = c(cols[1], "white"), space = "Lab")(minNum)
+rc2 <- colorRampPalette(colors = c("white", cols[11]), space = "Lab")(maxNum)
+
+rampcols <- c(rc1, rc2)
+
+par(xpd=NA)
+par(las=1)
+image.plot(1:nSpp,
+           1:nSpp,
+           predToPlot,
+           main="Relative pairwise covariance",
+           xlab="Species",
+           ylab="Species",
+           xaxt="n",
+           yaxt="n",
+           col=rampcols,
+           cex.lab=1.5,
+           cex.axis=1.5,
+           cex.main=1.5,
+           axis.args = list(cex.axis = 1.25))
+axis(1, seq(1,nSpp,5),las=1,cex.axis=1.5)
+axis(2, seq(1,nSpp,5),las=2,cex.axis=1.5)
+```
+
+## Figure 3C. Fisher's test of association
+
+Plot out the logit of the (fdr corrected) p-values for the Fisher exact test as a function of pairwise covariance
+```{r fig3C}
+logit <- function(x)
+{
+  return(log(x)-log(1-x))
+}
+
+par(fig = c(0,1,0,1))
+par(las=1)
+plot(pairwiseCovar,
+     logit(fisherPAdj),
+     xlab="Relative pairwise covariance",
+     ylab="logit(p-value) (FDR corrected)",
+     main="Fisher's test of association",
+     cex.axis=1.5,
+     cex.main=1.5,
+     cex.lab=1.5,
+     pch=20,
+     cex=1.5,
+     col="grey")
+points(pairwiseCovar[which(fisherPAdj<sigThresh)],
+       logit(fisherPAdj[which(fisherPAdj<sigThresh)]),
+       pch=20,
+       cex=1.5,
+       col="pink")
+legend("bottomleft",#x=-0.1,y=-45,
+       c("Significant association","Non-significant"),
+       pch=20,
+       cex=1.5,
+       col=c("pink","grey"),
+       ncol=1)
+```
+
+## Figure 3D. Fisher's test of association (alternate plot)
+
+Show which Fisher exact tests give a significant result in the matrix showing pairs of species
+```{r fig3D}
+par(xpd=NA)
+par(las=1)
+pValToPlotFDR <- matrix(p.adjust(pValToPlot, method = "fdr"),nrow=nSpp)
+twoColours <- colorRampPalette(colors = c("grey", "pink"), space = "Lab")(2)
+image(1:nSpp,
+      1:nSpp,
+      (pValToPlotFDR<sigThresh),
+      main="Fisher's test of association",
+      xlab="Species",
+      ylab="Species",
+      xaxt="n",
+      yaxt="n",
+      col=twoColours,
+      cex.lab=1.5,
+      cex.axis=1.5,
+      cex.main=1.5)
+axis(1, seq(1,nSpp,5),las=1,cex.axis=1.5)
+axis(2, seq(1,nSpp,5),las=2,cex.axis=1.5)
+
+print(paste("Pink =", sum(pValToPlotFDR<sigThresh,na.rm=T),"Grey =", sum(pValToPlotFDR>=sigThresh,na.rm=T),"Total =", sum(!is.na(pValToPlotFDR))))
+
+```
+
+## Figure 4A. Pairwise association via null model analysis (sim9)
+
+This shows which tests based on sim9 lead to significant results for facilitation and competition, colour coding them in the species matrix
+```{r fig4A}
+pSigMatrix <- matrix(0,nrow=nSpp,ncol=nSpp)
+for(i in 1:p$speciesPairs$nPairs)
+{
+  spOne <- p$speciesPairs$allSppOne[i]
+  spTwo <- p$speciesPairs$allSppTwo[i]
+
+  if(p$output$pHighAdj[i] < sigThresh)
+  {
+    pSigMatrix[which(sppOrder==spOne),which(sppOrder==spTwo)] <- 1
+    pSigMatrix[which(sppOrder==spTwo),which(sppOrder==spOne)] <- 1
+  }
+  if(p$output$pLowAdj[i] < sigThresh)
+  {
+    pSigMatrix[which(sppOrder==spOne),which(sppOrder==spTwo)] <- -1
+    pSigMatrix[which(sppOrder==spTwo),which(sppOrder==spOne)] <- -1
+  }
+}
+for(i in 1:nSpp)
+{
+  pSigMatrix[i,i] <- NA
+}
+threeColours <- colorRampPalette(colors = c("pink","grey","dodgerblue"), space = "Lab")(3)
+image(1:nSpp,
+      1:nSpp,
+      pSigMatrix,
+      main="Pairwise associations via null model analysis",
+      xlab="Species",
+      ylab="Species",
+      xaxt="n",
+      yaxt="n",
+      col=threeColours,
+      cex.lab=1.5,
+      cex.axis=1.5,
+      zlim=c(-1,1))
+axis(1, seq(1,nSpp,5),las=1,cex.axis=1.5)
+axis(2, seq(1,nSpp,5),las=2,cex.axis=1.5)
+
+print(paste("Pink =", sum(pSigMatrix==-1,na.rm=T),"Grey =" , sum(pSigMatrix==0,na.rm=T),"Blue =",sum(pSigMatrix==1,na.rm=T),"Total =",sum(!is.na(pSigMatrix))))
+
+
+```
+
+
+## Figure 4B. Pairwise association via null model analysis (sim9) when some species are undisturbed
+
+This shows which tests based on sim9 lead to significant results for facilitation and competition, colour coding them in the species matrix, this time with a set of species undisturbed
+```{r fig4B}
+# reload the cached versions from the top
+p <- pDistCached
+c <- patchMatrixCacheImmune
+m <- modelCacheImmune
+# now do the calculations
+pSigMatrix2 <- matrix(0,nrow=nSpp,ncol=nSpp)
+for(i in 1:p$speciesPairs$nPairs)
+{
+  spOne <- p$speciesPairs$allSppOne[i]
+  spTwo <- p$speciesPairs$allSppTwo[i]
+
+  if(p$output$pHighAdj[i] < sigThresh)
+  {
+    pSigMatrix2[which(sppOrder==spOne),which(sppOrder==spTwo)] <- 1
+    pSigMatrix2[which(sppOrder==spTwo),which(sppOrder==spOne)] <- 1
+  }
+  if(p$output$pLowAdj[i] < sigThresh)
+  {
+    pSigMatrix2[which(sppOrder==spOne),which(sppOrder==spTwo)] <- -1
+    pSigMatrix2[which(sppOrder==spTwo),which(sppOrder==spOne)] <- -1
+  }
+}
+for(i in 1:nSpp)
+{
+  pSigMatrix2[i,i] <- NA
+}
+threeColours <- colorRampPalette(colors = c("pink","grey","dodgerblue"), space = "Lab")(3)
+image(1:nSpp,
+      1:nSpp,
+      pSigMatrix2,
+      main=paste("Pairwise associations with",numNonDisturb,"unperturbed species"),
+      xlab="Species",
+      ylab="Species",
+      xaxt="n",
+      yaxt="n",
+      col=threeColours,
+      cex.lab=1.5,
+      cex.axis=1.5,
+      zlim=c(-1,1))
+axis(1, seq(1,nSpp,5),las=1,cex.axis=1.5)
+axis(2, seq(1,nSpp,5),las=2,cex.axis=1.5)
+par(xpd=NA)
+for(s in disturbSpp)
+{
+  points(which(sppOrder==s),nSpp+1,pch=16,cex=2)
+  points(nSpp+1,which(sppOrder==s),pch=16,cex=2)
+}
+
+print(paste("Pink =",sum(pSigMatrix2==-1,na.rm=T),"Grey =",sum(pSigMatrix2==0,na.rm=T),"Blue =",sum(pSigMatrix2==1,na.rm=T),"Total =",sum(!is.na(pSigMatrix2))))
+
+```
+
+And finally make a nice legend for the figure
+```{r fig4Blegend}
+plot.new()
+myL <- legend(x="center",
+              cex=1.0,
+              #cex=1.5,
+              c("Positive association","Negative association","Neither","Not applicable","Unperturbed"),
+              bty="n",
+              col=c("pink","dodgerblue","grey","black","black"),
+              lty=c(NA,NA,NA,NA),
+              lwd=c(NA,NA,NA,2),
+              pt.bg = c("pink","dodgerblue","grey","white","black"),
+              pch=c(22,22,22,22,20),
+              ncol=3,
+              pt.cex = 4,
+              bg="grey")
+
+```
+
+## Create an alternative version of Figure 4A, but using sim2
+
+This plots a version of Figure 4A, but based on the sim2 algorithm, rather than the sim9 one. It uses the cached information in `pOrigCache` from before.
+```{r Fig4A_Sim2_Version}
+# reset to cached version (i.e without undisturbed species)
+pII <- simPairwise(pOrigCache,simReps,burnInReps,FALSE)
+pSigMatrix <- matrix(0,nrow=nSpp,ncol=nSpp)
+for(i in 1:pII$speciesPairs$nPairs)
+{
+  spOne <- pII$speciesPairs$allSppOne[i]
+  spTwo <- pII$speciesPairs$allSppTwo[i]
+
+  if(pII$output$pHighAdj[i] < sigThresh)
+  {
+    pSigMatrix[which(sppOrder==spOne),which(sppOrder==spTwo)] <- 1
+    pSigMatrix[which(sppOrder==spTwo),which(sppOrder==spOne)] <- 1
+  }
+  if(pII$output$pLowAdj[i] < sigThresh)
+  {
+    pSigMatrix[which(sppOrder==spOne),which(sppOrder==spTwo)] <- -1
+    pSigMatrix[which(sppOrder==spTwo),which(sppOrder==spOne)] <- -1
+  }
+}
+for(i in 1:nSpp)
+{
+  pSigMatrix[i,i] <- NA
+}
+threeColours <- colorRampPalette(colors = c("pink","grey","dodgerblue"), space = "Lab")(3)
+image(1:nSpp,
+      1:nSpp,
+      pSigMatrix,
+      main="Pairwise associations via null model analysis (sim2)",
+      xlab="Species",
+      ylab="Species",
+      xaxt="n",
+      yaxt="n",
+      col=threeColours,
+      cex.lab=1.5,
+      cex.axis=1.5,
+      zlim=c(-1,1))
+axis(1, seq(1,nSpp,5),las=1,cex.axis=1.5)
+axis(2, seq(1,nSpp,5),las=2,cex.axis=1.5)
+
+print(paste("Pink =",sum(pSigMatrix==-1,na.rm=T),"Grey =",sum(pSigMatrix==0,na.rm=T),"Blue =",sum(pSigMatrix==1,na.rm=T),"Total =",sum(!is.na(pSigMatrix))))
+
+```
+
+## Create an alternative version of Figure 4B, but using sim2
+
+This plots a version of Figure 4B, but based on the sim2 algorithm, rather than the sim9 one. It uses the cached information in `pDistCached` from before.
+
+```{r fig4B_SimII}
+pIII <- simPairwise(pDistCached,simReps,burnInReps,FALSE)
+pSigMatrix2 <- matrix(0,nrow=nSpp,ncol=nSpp)
+for(i in 1:pIII$speciesPairs$nPairs)
+{
+  spOne <- pIII$speciesPairs$allSppOne[i]
+  spTwo <- pIII$speciesPairs$allSppTwo[i]
+
+  if(pIII$output$pHighAdj[i] < sigThresh)
+  {
+    pSigMatrix2[which(sppOrder==spOne),which(sppOrder==spTwo)] <- 1
+    pSigMatrix2[which(sppOrder==spTwo),which(sppOrder==spOne)] <- 1
+  }
+  if(pIII$output$pLowAdj[i] < sigThresh)
+  {
+    pSigMatrix2[which(sppOrder==spOne),which(sppOrder==spTwo)] <- -1
+    pSigMatrix2[which(sppOrder==spTwo),which(sppOrder==spOne)] <- -1
+  }
+}
+for(i in 1:nSpp)
+{
+  pSigMatrix2[i,i] <- NA
+}
+threeColours <- colorRampPalette(colors = c("pink","grey","dodgerblue"), space = "Lab")(3)
+image(1:nSpp,
+      1:nSpp,
+      pSigMatrix2,
+      main=paste("Pairwise associations with",numNonDisturb,"unperturbed species (sim2)"),
+      xlab="Species",
+      ylab="Species",
+      xaxt="n",
+      yaxt="n",
+      col=threeColours,
+      cex.lab=1.5,
+      cex.axis=1.5,
+      zlim=c(-1,1))
+axis(1, seq(1,nSpp,5),las=1,cex.axis=1.5)
+axis(2, seq(1,nSpp,5),las=2,cex.axis=1.5)
+par(xpd=NA)
+for(s in disturbSpp)
+{
+  points(which(sppOrder==s),nSpp+1,pch=16,cex=2)
+  points(nSpp+1,which(sppOrder==s),pch=16,cex=2)
+}
+print(paste("Pink =",sum(pSigMatrix2==-1,na.rm=T),"Grey =",sum(pSigMatrix2==0,na.rm=T),"Blue =",sum(pSigMatrix2==1,na.rm=T),"Total =",sum(!is.na(pSigMatrix2))))
+
+```
+
+## Using the Hmsc library
+
+Now analyse the (same) patch matrix data, using the Hmsc library (@HmscRpackage). We run four different Hmsc models, ranging in complexity from Model 0 that has no environmental covariate or latent factor, to Model 2, that includes patch-age as an environmental covariate. Model 1 controls for patch richness (number of species) as a single latent factor, thereby replicating the philiosophy of the Sim9 permutation algorithm (see @ovaskainen2020joint). Model 3 is the same as Model 2, except instead of patch-age, patch richness is used. Note that in Model 2, log(patch age) gives better fit, while in Model 3, log(patch diversity + 1) does not improve on just using patch diversity. 
+
+We run the four models, once on the species co-occurrence matrix without any immune species, and then with six immune species introduced. 
+
+The MCMC sampling parameters, tests of convergence, computation of significant species associations, and plots of model fit follow exactly the examples in (@tikhonov2020joint). We reset the seed to unity before any MCMC sampling for replicability. Note that using different seeds (or different MCMC parameters) may slightly change (quantitatively) the outputs. Also note that the computation time can be very long for these (several hours depending on CPUs). For convenience and debugging, setting `testRun <- TRUE` (towards the top of the markdown file) uses a less stringent parameter set, that does not yield satisfying convergence, but that can be run in a couple of minutes.
+
+```{r Hmsc, message=F, warning=F}
+#
+# This code is run twice, once with immunity and once without
+# only difference is that c etc. must be set first
+#
+for(hmscWithImmune in c(FALSE,TRUE))
+{
+  # recover the cached patch matrix and other relevant information
+  if(hmscWithImmune)
+  {
+    c <- patchMatrixCacheImmune
+    patchAge <- patchAgeCacheImmune
+    m <- modelCacheImmune
+    sTitleSuff <- " immune"
+  }else{
+    c <- patchMatrixCache
+    patchAge <- patchAgeCache 
+    m <- modelCache
+    sTitleSuff <- ""
+  }
+  ###########
+  #### Prepare data for use with Hmsc
+  ###########
+  
+  ## 1. c is the community matrix:
+  colnames(c)<-paste("sp",1:nSpp,sep="")
+  
+  # 2. Environmental covariates:
+  ## all patches are identical, so:
+  # x1 is randomly varying around 1 (dummy variable)
+  # x3 is actual patch age 
+  x=data.frame(x1=rnorm(nPatches,m=1,sd=0.1), x3=patchAge)
+  
+  ## 3. Species traits:
+  # we take their "variance" (inverse of fastness)
+  # dummy is a dummy trait
+  t = data.frame(fastness=m$modelCalculations$vVariance, dummy=rnorm(nSpp,m=1,sd=0.1))
+  
+  ############
+  ##### Run the four models
+  ############
+  
+  #################
+  ####### Model 0: naive co-occurrence analysis (sim2-like)
+  #################
+  
+  ## we introduce a dummy random effect to facilitate the computation of residual associations
+  studyDesign = data.frame(sites=as.factor(1:nPatches))
+  rL = list()
+  rL[['sites']] = HmscRandomLevel(units=unique(studyDesign$sites))
+  
+  m0 <- Hmsc(Y = c, 
+             XData=x, 
+             XFormula=~1,
+             studyDesign= studyDesign, 
+             ranLevels=rL, 
+             distr="probit")
+  set.seed(1)
+  m0run = sampleMcmc(m0, 
+                     samples = samples, 
+                     thin = thin,
+                     adaptNf = rep(ceiling(0.4*samples*thin),1),
+                     transient = ceiling(0.5*samples*thin),
+                     nChains = nChains, 
+                     nParallel = 1,
+                     initPar = "fixed effects",
+                     verbose=0)
+  
+  #################
+  ####### Model 1: pseudo sim9 approach (with one latent factor)
+  #################
+  
+  ## we introduce a dummy random effect to facilitate the computation of residual associations
+  ## we further introduce a latent factor based on patch alpha diversity (requires NO additional information, and mimics sim9)
+  spnb = apply(c,1,sum)
+  studyDesign = data.frame(sites=as.factor(1:nPatches),spnb=as.factor(spnb))
+  rL = list()
+  rL[['sites']] = HmscRandomLevel(units=unique(studyDesign$sites))
+  rL[['spnb']] = HmscRandomLevel(units=unique(spnb))
+  
+  m1 <- Hmsc(Y = c, 
+             XData=x, 
+             XFormula=~1,
+             studyDesign = studyDesign, 
+             ranLevels=rL, 
+             distr="probit")
+  set.seed(1)
+  m1run = sampleMcmc(m1, 
+                     samples = samples, 
+                     thin = thin,
+                     adaptNf = rep(ceiling(0.4*samples*thin),2),
+                     transient = ceiling(0.5*samples*thin),
+                     nChains = nChains, 
+                     nParallel = 1,
+                     initPar = "fixed effects",
+                     verbose=0)
+
+  #################
+  ####### Model 2: 'patch age as a covariate' approach
+  #################
+  
+  ## we introduce a dummy random effect to facilitate the computation of residual associations
+  ## we further introduce patch age as an explicit environmental covariate
+  studyDesign = data.frame(sites=as.factor(1:nPatches))
+  rL = list()
+  rL[['sites']] = HmscRandomLevel(units=unique(studyDesign$sites))
+  
+  ## note: we use log(patch age) as a covariate since patch age is exponentially distributed
+  m2 <- Hmsc(Y = c, 
+             XData=x, 
+             XFormula=~log(x3),
+             studyDesign = studyDesign, 
+             ranLevels=rL, 
+             distr="probit")
+  set.seed(1)
+  m2run = sampleMcmc(m2, 
+                     samples = samples, 
+                     thin = thin,
+                     adaptNf = rep(ceiling(0.4*samples*thin),1),
+                     transient = ceiling(0.5*samples*thin),
+                     nChains = nChains, 
+                     nParallel = 1,
+                     initPar = "fixed effects",
+                     verbose=0)
+
+  #################
+  ####### Model 3: 'patch richness as a covariate' approach (surrogate of actual patch age)
+  #################
+  
+  ## we introduce a dummy random effect to facilitate the computation of residual associations
+  ## we further introduce patch richness as an explicit environmental covariate
+  studyDesign = data.frame(sites=as.factor(1:nPatches))
+  rL = list()
+  rL[['sites']] = HmscRandomLevel(units=unique(studyDesign$sites))
+  spnb = apply(c,1,sum)
+  x$div <- spnb
+  
+  m3 <- Hmsc(Y = c, 
+             XData=x, 
+             XFormula=~div,
+             studyDesign = studyDesign, 
+             ranLevels=rL, 
+             distr="probit")
+  set.seed(1)
+  m3run = sampleMcmc(m3, 
+                     samples = samples, 
+                     thin = thin,
+                     adaptNf = rep(ceiling(0.4*samples*thin),1),
+                     transient = ceiling(0.5*samples*thin),
+                     nChains = nChains, 
+                     nParallel = 1,
+                     initPar = "fixed effects",
+                     verbose=0)
+
+  #################
+  ####### Model 4: log patch richness as a covariate' approach (surrogate of actual patch age)
+  #################
+  ## we introduce a dummy random effect to facilitate the computation of residual associations
+  ## we further introduce patch richness as an explicit environmental covariate
+  studyDesign = data.frame(sites=as.factor(1:nPatches))
+  rL = list()
+  rL[['sites']] = HmscRandomLevel(units=unique(studyDesign$sites))
+  spnb = apply(c,1,sum)
+  x$div <- log(spnb + 1)
+  
+  m4 <- Hmsc(Y = c, 
+             XData=x, 
+             XFormula=~div,
+             studyDesign = studyDesign, 
+             ranLevels=rL, 
+             distr="probit")
+  set.seed(1)
+  m4run = sampleMcmc(m4, 
+                     samples = samples, 
+                     thin = thin,
+                     adaptNf = rep(ceiling(0.4*samples*thin),1),
+                     transient = ceiling(0.5*samples*thin),
+                     nChains = nChains, 
+                     nParallel = 1,
+                     initPar = "fixed effects",
+                     verbose=0)
+  
+  ############
+  ##### Generate plots of the results of the model runs
+  ############
+  
+  par(mfrow = c(1, 1))
+  
+  ########### Model 0
+  
+  supportLevel <- 1 - sigThresh
+  
+  OmegaCor0 = computeAssociations(m0run, 
+                                  thin=100, 
+                                  start=1)
+  
+  toPlot = ((OmegaCor0[[1]]$support>supportLevel) + (OmegaCor0[[1]]$support<(1-supportLevel))>0)*OmegaCor0[[1]]$mean
+  for(i in 1:nSpp)
+  {
+    toPlot[i,i] <- NA
+  }
+  threeColours <- colorRampPalette(colors = c("dodgerblue","grey","pink"), space = "Lab")(3)
+  
+  image(x=1:nSpp, 
+        y=1:nSpp, 
+        z=toPlot[sppOrder,sppOrder],
+        breaks=c(-1e10,-0.001,0.001,1e10),
+        main=paste("Hmsc model 0",sTitleSuff,sep=""),
+        xlab="Species",
+        ylab="Species",
+        xaxt="n",
+        yaxt="n",
+        col=threeColours,
+        cex.lab=1.5,
+        cex.axis=1.5)
+  
+  axis(1, seq(1,nSpp,5),las=1,cex.axis=1.5)
+  axis(2, seq(1,nSpp,5),las=2,cex.axis=1.5)
+  
+  ########### Model 1
+  
+  OmegaCor1= computeAssociations(m1run, 
+                                 thin=100, 
+                                 start=1)
+  
+  toPlot = ((OmegaCor1[[1]]$support>supportLevel) + (OmegaCor1[[1]]$support<(1-supportLevel))>0)*OmegaCor1[[1]]$mean
+  for(i in 1:nSpp)
+  {
+    toPlot[i,i] <- NA
+  }
+  threeColours <- colorRampPalette(colors = c("dodgerblue","grey","pink"), space = "Lab")(3)
+  
+  image(x=1:nSpp, 
+        y=1:nSpp, 
+        z=toPlot[sppOrder,sppOrder],
+        breaks=c(-1e10,-0.001,0.001,1e10),
+        main=paste("Hmsc model 1",sTitleSuff,sep=""),
+        xlab="Species",
+        ylab="Species",
+        xaxt="n",
+        yaxt="n",
+        col=threeColours,
+        cex.lab=1.5,
+        cex.axis=1.5)
+  axis(1, seq(1,nSpp,5),las=1,cex.axis=1.5)
+  axis(2, seq(1,nSpp,5),las=2,cex.axis=1.5)
+  
+  ########### Model 2
+  
+  OmegaCor2= computeAssociations(m2run, thin=100, start=1)
+  
+  toPlot = ((OmegaCor2[[1]]$support>supportLevel) + (OmegaCor2[[1]]$support<(1-supportLevel))>0)*OmegaCor2[[1]]$mean
+  for(i in 1:nSpp)
+  {
+    toPlot[i,i] <- NA
+  }
+  threeColours <- colorRampPalette(colors = c("dodgerblue","grey","pink"), space = "Lab")(3)
+  
+  image(x=1:nSpp, 
+        y=1:nSpp, 
+        z=toPlot[sppOrder,sppOrder],
+        breaks=c(-1e10,-0.001,0.001,1e10),
+        main=paste("Hmsc model 2",sTitleSuff,sep=""),
+        xlab="Species",
+        ylab="Species",
+        xaxt="n",
+        yaxt="n",
+        col=threeColours,
+        cex.lab=1.5,
+        cex.axis=1.5)
+  axis(1, seq(1,nSpp,5),las=1,cex.axis=1.5)
+  axis(2, seq(1,nSpp,5),las=2,cex.axis=1.5)
+  
+  ########### Model 3
+  
+  OmegaCor3= computeAssociations(m3run, thin=100, start=1)
+  
+  toPlot = ((OmegaCor3[[1]]$support>supportLevel) + (OmegaCor3[[1]]$support<(1-supportLevel))>0)*OmegaCor3[[1]]$mean
+  for(i in 1:nSpp)
+  {
+    toPlot[i,i] <- NA
+  }
+  threeColours <- colorRampPalette(colors = c("dodgerblue","grey","pink"), space = "Lab")(3)
+  
+  image(x=1:nSpp, 
+        y=1:nSpp, 
+        z=toPlot[sppOrder,sppOrder],
+        breaks=c(-1e10,-0.001,0.001,1e10),
+        main=paste("Hmsc model 3",sTitleSuff,sep=""),
+        xlab="Species",
+        ylab="Species",
+        xaxt="n",
+        yaxt="n",
+        col=threeColours,
+        cex.lab=1.5,
+        cex.axis=1.5)
+  axis(1, seq(1,nSpp,5),las=1,cex.axis=1.5)
+  axis(2, seq(1,nSpp,5),las=2,cex.axis=1.5)
+  
+  ########### Model 4
+  
+  OmegaCor4= computeAssociations(m4run, thin=100, start=1)
+  
+  toPlot = ((OmegaCor4[[1]]$support>supportLevel) + (OmegaCor4[[1]]$support<(1-supportLevel))>0)*OmegaCor4[[1]]$mean
+  for(i in 1:nSpp)
+  {
+    toPlot[i,i] <- NA
+  }
+  threeColours <- colorRampPalette(colors = c("dodgerblue","grey","pink"), space = "Lab")(3)
+  
+  image(x=1:nSpp, 
+        y=1:nSpp, 
+        z=toPlot[sppOrder,sppOrder],
+        breaks=c(-1e10,-0.001,0.001,1e10),
+        main=paste("Hmsc model 4",sTitleSuff,sep=""),
+        xlab="Species",
+        ylab="Species",
+        xaxt="n",
+        yaxt="n",
+        col=threeColours,
+        cex.lab=1.5,
+        cex.axis=1.5)
+  axis(1, seq(1,nSpp,5),las=1,cex.axis=1.5)
+  axis(2, seq(1,nSpp,5),las=2,cex.axis=1.5)
+
+  # for the case without immune species, also plot selected elements of the model fit for mod2  
+  if(!hmscWithImmune)
+  {
+    Gradient = constructGradient(m2run, 
+                                 focalVariable="x3",
+                                 ngrid=30)
+    predY = predict(m2run, 
+                    XData=Gradient$XDataNew, 
+                    studyDesign=Gradient$studyDesignNew,
+                    ranLevels=Gradient$rLNew, 
+                    expected=TRUE)
+    ## show psecies richness as a function of patch age
+    
+    plotGradient(m2run, 
+                 Gradient, 
+                 pred=predY, 
+                 measure="S", 
+                 las=1,
+                 showData = TRUE, 
+                 main='Species richness (measure="S")')
+    
+    ## show occupancy per species
+    ## we take one fast and one slow species
+    lala=order(t$fastness)[c(1,31)]
+    par(mfrow=c(1,2))
+    for (ss in lala)
+    {
+      plotGradient(m2run, 
+                   Gradient, 
+                   pred=predY, 
+                   measure="Y", 
+                   index=ss, 
+                   las=1,
+                   showData = TRUE, 
+                   main='Focal species occurrence (measure="Y")')
+    }
+  }
+}
+```
+
+## Bibliography
