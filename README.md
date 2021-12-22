@@ -7,4 +7,4 @@ Aside from README.md, the repository contains four files
   - metapopulationDynamics.html: the knitted output of the R Markdown (to follow)
   - refs.bib: the bibtex file referred to in the R Markdown file and required to make it knit
   
-Note that on L38 of the .Rmd file there is a boolean switch that can be used to toggle between a short testing run and a full length run (the latter takes ~24 hours or so on a reasonably powerful desktop) 
+Note that on L38 of the .Rmd file there is a boolean switch that can be used to toggle between a short testing run and a full length run (the latter takes ~20 hours or so on a reasonably powerful desktop) 
